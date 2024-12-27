@@ -26,6 +26,10 @@ class LoGRe(object):
         self.all_paths = all_paths
         self.num_non_executable_programs = []
         self.in_candidate = 0
+        self.cached_neighbors = {}
+        self.cached_programs, self.cached_siment = {}, {}
+        self.cached_num_ret_nn, self.cached_zero_ctr = {}, {}
+        self.cached_rank_results = {}
 
     # Cluster entities according to their types
     def cluster_entities_type(self, type_file):  #dict{e: type}, dict{type: set(e)}
@@ -44,13 +48,15 @@ class LoGRe(object):
     
     # Get entities having the same r.
     def get_neighbors(self, r: str):
-        nearest_entities = self.entity_vocab.keys()
-        temp = []
-        for nn in nearest_entities:
-            if len(self.train_map[nn, r]) > 0:
-                temp.append(nn)
-        nearest_entities = temp
-        return nearest_entities
+        # Update: add cache to save time
+        if self.cached_neighbors.get(r) is None:
+            nearest_entities = self.entity_vocab.keys()
+            temp = []
+            for nn in nearest_entities:
+                if len(self.train_map[nn, r]) > 0:
+                    temp.append(nn)
+            self.cached_neighbors[r] = temp
+        return self.cached_neighbors[r]
 
     # Given an entity and answer, get all paths ending at the answer node within the subgraph surrounding the entity.
     @staticmethod
@@ -65,13 +71,20 @@ class LoGRe(object):
 
     # Given a relation r, run get_programs for entities having r and record the corresponding terminal entities of the paths for the calculation of answer similarity.
     def get_programs_from_nearest_neighbors(self, r: str, nn_func: Callable):
-        all_programs = []
-        ansims = []
+        # Update: add cache to save time
+        if r in self.cached_programs:
+            self.all_num_ret_nn.append(self.cached_num_ret_nn[r])
+            self.all_zero_ctr.append(self.cached_zero_ctr[r])
+            return self.cached_programs[r]
+        all_programs = set()
+        self.cached_siment[r] = {}
         nearest_entities = nn_func(r)
         if nearest_entities is None:
             self.all_num_ret_nn.append(0)
+            self.cached_num_ret_nn[r] = 0
             return None
         self.all_num_ret_nn.append(len(nearest_entities))
+        self.cached_num_ret_nn[r] = len(nearest_entities)
         zero_ctr = 0
         for e in nearest_entities:
             if len(self.train_map[(e, r)]) > 0:
@@ -79,40 +92,41 @@ class LoGRe(object):
                 nn_answers = self.train_map[(e, r)]
                 for nn_ans in nn_answers:
                     ps = self.get_programs(e, nn_ans, paths_e)
-                    all_programs += ps
-                    ansims += [nn_ans]*len(ps)
+                    for p in ps:
+                        # filter the program if it is equal to the query relation
+                        if len(p) == 1 and p[0] == r:
+                            continue
+                        all_programs.add(tuple(p))
+                        p_str = '-'.join(p)
+                        if p_str not in self.cached_siment[r]:
+                            self.cached_siment[r][p_str] = set()
+                        self.cached_siment[r][p_str].add(nn_ans)
             elif len(self.train_map[(e, r)]) == 0:
                 zero_ctr += 1
+        all_programs = list(all_programs)
         self.all_zero_ctr.append(zero_ctr)
-        return all_programs, ansims
+        self.cached_zero_ctr[r] = zero_ctr
+        self.cached_programs[r] = all_programs
+        return all_programs
 
-    # Rank paths and record the corresponding terminal entities of the paths for the calculation of answer similarity.
-    def rank_programs(self, list_programs: List[List[str]], r: str, ansims: List):
-        unique_programs = set()
-        sim_score = {}
-        for i in range(len(list_programs)):
-            unique_programs.add(tuple(list_programs[i]))
-            if tuple(list_programs[i]) not in sim_score:
-                sim_score[tuple(list_programs[i])] = set()
-            sim_score[tuple(list_programs[i])].add(ansims[i])
+    # Rank paths.
+    def rank_programs(self, list_programs: List[List[str]], r: str):
+        # Update: add cache to save time
+        if r in self.cached_rank_results:
+            return self.cached_rank_results[r]
+        unique_programs = list_programs
         # now get the score of each path
         path_and_scores = []
         for p in unique_programs:
             try:
                 path_and_scores.append((p, self.args.precision_map[r][p] * self.args.hop_factors[len(p)]))
             except KeyError:
-                if len(p) == 1 and p[0] == r:
-                    continue  # ignore query relation
-                else:
-                    # still a path or rel is missing.
-                    path_and_scores.append((p, 0))
+                continue
 
         # sort paths by their scores
         sorted_programs = [k for k, v in sorted(path_and_scores, key=lambda item: -item[1])]
-        sorted_ansims = []
-        for p in sorted_programs:
-            sorted_ansims.append(list(sim_score[p]))
-        return sorted_programs, sorted_ansims
+        self.cached_rank_results[r] = sorted_programs
+        return sorted_programs
 
     # Starting from a given entity, execute the path by doing depth-first search. If there are multiple entities with the same relation, we select up to max_branch entities.
     def execute_one_program(self, e: str, path: List[str], depth: int, max_branch: int):
@@ -131,10 +145,9 @@ class LoGRe(object):
             answers += self.execute_one_program(e_next, path, depth + 1, max_branch)
         return answers
 
-    # Given an entity, relation, and path list, run execute_one_program for each path, and record the corresponding terminal entities of the paths for the calculation of answer similarity.
-    def execute_programs(self, e: str, r: str, path_list: List[List[str]], ansims: List, max_branch: int):
+    # Given an entity, relation, and path list, run execute_one_program for each path.
+    def execute_programs(self, e: str, r: str, path_list: List[List[str]], max_branch: int):
         all_answers = []
-        all_siment = []
         not_executed_paths = []
         execution_fail_counter = 0
         executed_path_counter = 0
@@ -159,15 +172,12 @@ class LoGRe(object):
             else:
                 executed_path_counter += 1
             all_answers += ans
-            all_siment += [ansims[i]]*len(ans)
         self.num_non_executable_programs.append(execution_fail_counter)
-        return all_answers, all_siment, not_executed_paths
+        return all_answers, not_executed_paths
 
     # Aggregate the answers, assigning each candidate answer a score by summing the scores of the paths reaching it. Record the corresponding terminal entities of the paths for the calculation of answer similarity.
-    @staticmethod
-    def aggregate_answers(list_answers: List[Tuple[str, float, List[str]]], all_siment: List[str]):
+    def aggregate_answers(self, r, list_answers: List[Tuple[str, float, List[str]]]):
         count_map = {}
-        uniq_entities = set()
         ent_map = {}
         for i in range(len(list_answers)):
             (e, e_score, path) = list_answers[i]
@@ -176,8 +186,7 @@ class LoGRe(object):
                 ent_map[e] = set()
             if path not in count_map[e]:
                 count_map[e][path] = e_score  # just count once for a path type.
-            uniq_entities.add(e)
-            ent_map[e] = ent_map[e] | set(all_siment[i])
+            ent_map[e] = ent_map[e] | self.cached_siment[r]['-'.join(path)]
         score_map = defaultdict(int)
         for e, path_scores_map in count_map.items():
             sum_path_score = 0
@@ -213,8 +222,7 @@ class LoGRe(object):
                     ss = 0
                     for ent in all_siment[pred]:
                         tmp = self.ansim[self.entity_vocab[pred]][self.entity_vocab[ent]]
-                        if tmp > ss:
-                            ss = tmp
+                        ss = max(ss, tmp)
                     filtered_answers[pred] = answers[pred] * ss
             sorted_filtered_answers = sorted(filtered_answers.items(), key=lambda kv: -kv[1])
             rank = LoGRe.get_rank_in_list(gold_answer, sorted_filtered_answers)
@@ -272,7 +280,7 @@ class LoGRe(object):
                     self.train_map[(e2, r_inv)] = temp_map[(e2, r_inv)]
                 continue  # this entity was not seen during train; skip
             
-            all_programs, ansims = self.get_programs_from_nearest_neighbors(r, self.get_neighbors)
+            all_programs = self.get_programs_from_nearest_neighbors(r, self.get_neighbors)
             if all_programs is None or len(all_programs) == 0:
                 # put it back
                 self.train_map[(e1, r)] = orig_train_e2_list
@@ -284,31 +292,20 @@ class LoGRe(object):
                     continue
                 if r not in learnt_programs:
                     learnt_programs[r] = {}
-                p = tuple(p)
                 if p not in learnt_programs[r]:
                     learnt_programs[r][p] = 0
                 learnt_programs[r][p] += 1
 
-            # filter the program if it is equal to the query relation
-            temp = []
-            filter_ansims = []
-            for i in range(len(all_programs)):
-                if len(all_programs[i]) == 1 and all_programs[i][0] == r:
-                    continue
-                temp.append(all_programs[i])
-                filter_ansims.append(ansims[i])
-            all_programs = temp
-
             if len(all_programs) > 0:
                 non_zero_ctr += len(e2_list)
 
-            all_uniq_programs, ansims = self.rank_programs(all_programs, r, filter_ansims)
+            all_uniq_programs = self.rank_programs(all_programs, r)
 
             num_programs.append(len(all_uniq_programs))
             # Now execute the program
-            answers, all_siment, not_executed_programs = self.execute_programs(e1, r, all_uniq_programs, ansims, self.args.max_branch)
+            answers, not_executed_programs = self.execute_programs(e1, r, all_uniq_programs, self.args.max_branch)
 
-            answers, all_siment = self.aggregate_answers(answers, all_siment)
+            answers, all_siment = self.aggregate_answers(r, answers)
             if len(answers) > 0:
                 _10, _5, _3, _1, rr, mr1 = self.get_hits(answers, e2_list, all_siment, (e1, r))
                 hits_10 += _10
